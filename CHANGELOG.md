@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* Accept a `config` argument in `parse_form` and fail closed on exceeded limits, bodies shorter than `Content-Length`, and unterminated multipart messages.
+
 ## 0.0.33 (2026-10-31)
 
 * Drop Python 3.10 support [#329](https://github.com/Kludex/python-multipart/pull/329).

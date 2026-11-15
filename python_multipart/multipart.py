@@ -1983,11 +1983,18 @@ def parse_form(
     on_field: Callable[[Field], None] | None,
     on_file: Callable[[File], None] | None,
     chunk_size: int = 1048576,
+    config: dict[Any, Any] | None = None,
 ) -> None:
     """This function is useful if you just want to parse a request body,
     without too much work.  Pass it a dictionary-like object of the request's
     headers, and a file-like object for the input stream, along with two
     callbacks that will get called whenever a field or file is parsed.
+
+    Unlike the lower-level parsers, this function fails closed: it raises a
+    [`FormParserError`][python_multipart.exceptions.FormParserError] if a
+    configured limit (e.g. ``MAX_BODY_SIZE``) is exceeded, if the request body
+    is shorter than the declared Content-Length, or if a multipart message
+    ends before its closing boundary.
 
     Args:
         headers: A dictionary-like object of HTTP headers.  The only required header is Content-Type.
@@ -1996,12 +2003,15 @@ def parse_form(
         on_file: Callback to call with each parsed file.
         chunk_size: The maximum size to read from the input stream and write to the parser at one time.
             Defaults to 1 MiB.
+        config: Configuration variables to pass to the FormParser, e.g. ``MAX_BODY_SIZE``, ``MAX_FIELDS``
+            or ``MAX_FIELD_SIZE``.  Exceeding any of these limits raises an error instead of silently
+            truncating the body.
     """
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be a positive number, not {chunk_size!r}")
 
     # Create our form parser.
-    parser = create_form_parser(headers, on_field, on_file)
+    parser = create_form_parser(headers, on_field, on_file, config if config is not None else {})
 
     # Read chunks of 1MiB and write to the parser, but never read more than
     # the given Content-Length, if any.
@@ -2010,23 +2020,38 @@ def parse_form(
         content_length = int(content_length)
         if content_length < 0:
             raise ValueError("Content-Length must be non-negative")
-    else:
-        content_length = float("inf")
+    max_length = content_length if content_length is not None else float("inf")
     bytes_read = 0
 
     while True:
         # Read only up to the Content-Length given.
-        max_readable = int(min(content_length - bytes_read, chunk_size))
+        max_readable = int(min(max_length - bytes_read, chunk_size))
         buff = input_stream.read(max_readable)
 
-        # Write to the parser and update our length.
-        parser.write(buff)
+        # Write to the parser and update our length.  The underlying parsers
+        # silently truncate data that exceeds their maximum size, so a short
+        # write means a configured limit (e.g. MAX_BODY_SIZE) was exceeded -
+        # fail closed instead of accepting a truncated body.
+        if parser.write(buff) != len(buff):
+            raise FormParserError(f"Body size exceeded the maximum of {parser.config['MAX_BODY_SIZE']} bytes.")
         bytes_read += len(buff)
 
         # If we get a buffer that's smaller than the size requested, or if we
         # have read up to our content length, we're done.
-        if len(buff) != max_readable or bytes_read == content_length:
+        if len(buff) != max_readable or bytes_read == max_length:
             break
+
+    # Fail closed if the peer sent less data than the declared Content-Length.
+    if content_length is not None and bytes_read < content_length:
+        raise FormParserError(
+            f"Request body shorter than Content-Length: expected {content_length} bytes, received {bytes_read}."
+        )
 
     # Tell our parser that we're done writing data.
     parser.finalize()
+
+    # Fail closed on an unterminated multipart message (i.e. the closing
+    # boundary was never seen).
+    inner_parser = parser.parser
+    if isinstance(inner_parser, MultipartParser) and inner_parser.state is not MultipartState.END:
+        raise FormParserError("Multipart message ended before the closing boundary was found.")
