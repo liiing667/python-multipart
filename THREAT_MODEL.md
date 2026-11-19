@@ -17,7 +17,7 @@
 ## Security goals
 
 - Malformed input raises `FormParserError` or one of its subclasses.
-- `MAX_HEADER_COUNT`, `MAX_HEADER_SIZE`, and `MAX_BODY_SIZE` are enforced.
+- `MAX_HEADER_COUNT`, `MAX_HEADER_SIZE`, `MAX_FIELDS`, `MAX_FIELD_SIZE`, `MAX_FILES`, and `MAX_BODY_SIZE` are enforced.
 - CPU use stays proportional to the size of the input.
 - Uploaded files stay inside `UPLOAD_DIR`.
 - Temporary files are deleted when `UPLOAD_DELETE_TMP` is `True`.

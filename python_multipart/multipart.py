@@ -55,6 +55,7 @@ if TYPE_CHECKING:
         MAX_BODY_SIZE: float
         MAX_FIELDS: int | float
         MAX_FIELD_SIZE: int | float
+        MAX_FILES: int | float
         MAX_HEADER_COUNT: int
         MAX_HEADER_SIZE: int
 
@@ -1660,6 +1661,7 @@ class FormParser:
         "MAX_BODY_SIZE": float("inf"),
         "MAX_FIELDS": float("inf"),
         "MAX_FIELD_SIZE": float("inf"),
+        "MAX_FILES": float("inf"),
         "MAX_HEADER_COUNT": DEFAULT_MAX_HEADER_COUNT,
         "MAX_HEADER_SIZE": DEFAULT_MAX_HEADER_SIZE,
         "MAX_MEMORY_FILE_SIZE": 1 * 1024 * 1024,
@@ -1805,6 +1807,14 @@ class FormParser:
                 self.logger.error("No boundary given")
                 raise FormParserError("No boundary given")
 
+            max_fields = self.config["MAX_FIELDS"]
+            max_field_size = self.config["MAX_FIELD_SIZE"]
+            max_files = self.config["MAX_FILES"]
+            limits = (("MAX_FIELDS", max_fields), ("MAX_FIELD_SIZE", max_field_size), ("MAX_FILES", max_files))
+            for key, limit in limits:
+                if not isinstance(limit, (int, float)) or not limit >= 0:
+                    raise ValueError(f"{key} must be a non-negative number, not {limit!r}")
+
             header_name: list[bytes] = []
             header_value: list[bytes] = []
             headers: dict[bytes, bytes] = {}
@@ -1812,6 +1822,9 @@ class FormParser:
             f_multi: File | Field | None = None
             writer: File | Field | Base64Decoder | QuotedPrintableDecoder | None = None
             is_file = False
+            field_count = 0
+            file_count = 0
+            field_size = 0
 
             def on_part_begin() -> None:
                 # Reset headers in case this isn't the first part.
@@ -1819,8 +1832,12 @@ class FormParser:
                 headers = {}
 
             def on_part_data(data: bytes, start: int, end: int) -> None:
-                nonlocal writer
+                nonlocal field_size
                 assert writer is not None
+                if not is_file:
+                    field_size += end - start
+                    if field_size > max_field_size:
+                        raise FormParserError(f"Field exceeded maximum size of {max_field_size} bytes.")
                 writer.write(data[start:end])
                 # TODO: check for error here.
 
@@ -1849,9 +1866,10 @@ class FormParser:
                 del header_value[:]
 
             def on_headers_finished() -> None:
-                nonlocal is_file, f_multi, writer
+                nonlocal is_file, f_multi, writer, field_count, file_count, field_size
                 # Reset the 'is file' flag.
                 is_file = False
+                field_size = 0
 
                 # Parse the content-disposition header.
                 content_disp = headers.get(b"content-disposition")
@@ -1868,8 +1886,14 @@ class FormParser:
                 content_type_b = headers.get(b"content-type")
                 content_type = content_type_b.decode("latin-1") if content_type_b is not None else None
                 if file_name is None:
+                    field_count += 1
+                    if field_count > max_fields:
+                        raise FormParserError(f"Too many fields. Maximum number of fields is {max_fields}.")
                     f_multi = Field(field_name, content_type=content_type)
                 else:
+                    file_count += 1
+                    if file_count > max_files:
+                        raise FormParserError(f"Too many files. Maximum number of files is {max_files}.")
                     f_multi = File(file_name, field_name, config=self.config, content_type=content_type)
                     is_file = True
 
