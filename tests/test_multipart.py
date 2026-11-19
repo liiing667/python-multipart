@@ -1455,6 +1455,108 @@ class TestFormParser(unittest.TestCase):
         with self.assertRaisesRegex(MultipartParseError, "Maximum header size exceeded"):
             self.f.write(payload)
 
+    def test_multipart_rejects_nested_multipart_part(self) -> None:
+        # A nested multipart part would spawn an independent parser whose parts
+        # do not share this request's policy or budget.
+        self.make("poc")
+        payload = (
+            b'--poc\r\nContent-Disposition: form-data; name="outer"\r\n'
+            b"Content-Type: multipart/mixed; boundary=inner\r\n\r\n"
+            b'--inner\r\nContent-Disposition: form-data; name="hidden"\r\n\r\nx\r\n--inner--\r\n'
+            b"--poc--\r\n"
+        )
+        with self.assertRaisesRegex(FormParserError, "Nested multipart content is not allowed"):
+            self.f.write(payload)
+
+    @parametrize(
+        "header_line",
+        [
+            b"Content-Disposition: form-data; name*=UTF-8''evil",
+            b"Content-Disposition: form-data; name=\"safe\"; name*=UTF-8''evil",
+            b"Content-Disposition: form-data; name=\"f\"; filename*=UTF-8''evil.sh",
+            b'Content-Disposition: form-data; name="f"; filename*0="a"; filename*1="b"',
+        ],
+    )
+    def test_multipart_rejects_rfc2231_extended_parameters(self, header_line: bytes) -> None:
+        self.make("poc")
+        payload = b"--poc\r\n" + header_line + b"\r\n\r\nv\r\n--poc--\r\n"
+        with self.assertRaisesRegex(FormParserError, "RFC 2231 extended parameters are not allowed"):
+            self.f.write(payload)
+
+    def test_multipart_star_in_quoted_value_is_not_extended_parameter(self) -> None:
+        # A `*` inside a quoted parameter value must not be mistaken for the
+        # RFC 2231 extended syntax.
+        self.make("poc")
+        payload = b'--poc\r\nContent-Disposition: form-data; name="x"; title="a*b"\r\n\r\nv\r\n--poc--\r\n'
+        self.f.write(payload)
+        self.f.finalize()
+        self.assert_field(b"x", b"v")
+
+    def test_multipart_enforces_field_count_budget(self) -> None:
+        self.make("poc", config={"MAX_FIELDS": 2})
+        payload = (
+            b"".join(b'--poc\r\nContent-Disposition: form-data; name="f%d"\r\n\r\nv\r\n' % i for i in range(3))
+            + b"--poc--\r\n"
+        )
+        with self.assertRaisesRegex(FormParserError, "Too many fields"):
+            self.f.write(payload)
+
+    def test_multipart_enforces_field_size_budget(self) -> None:
+        self.make("poc", config={"MAX_FIELD_SIZE": 4})
+        payload = b'--poc\r\nContent-Disposition: form-data; name="x"\r\n\r\nABCDE\r\n--poc--\r\n'
+        with self.assertRaisesRegex(FormParserError, "Field exceeded maximum size"):
+            self.f.write(payload)
+
+    def test_multipart_field_size_budget_does_not_apply_to_files(self) -> None:
+        # File uploads are bounded by MAX_BODY_SIZE, not the field-size budget.
+        self.make("poc", config={"MAX_FIELD_SIZE": 4})
+        payload = b'--poc\r\nContent-Disposition: form-data; name="f"; filename="a.txt"\r\n\r\nABCDE\r\n--poc--\r\n'
+        self.f.write(payload)
+        self.f.finalize()
+        self.assertEqual(len(self.files), 1)
+
+    def test_invalid_multipart_field_limit(self) -> None:
+        for key in ("MAX_FIELDS", "MAX_FIELD_SIZE"):
+            with self.assertRaisesRegex(ValueError, "must be a non-negative number"):
+                FormParser("multipart/form-data", None, None, boundary=b"b", config={key: -1})
+
+    def test_incomplete_multipart_body_fails_at_finalize(self) -> None:
+        self.make("poc")
+        self.f.write(b'--poc\r\nContent-Disposition: form-data; name="x"\r\n\r\nabc')
+        with self.assertRaisesRegex(MultipartParseError, "closing boundary not found"):
+            self.f.finalize()
+
+    def test_failed_request_removes_its_disk_files(self) -> None:
+        with tempfile.TemporaryDirectory() as upload_dir:
+            self.make("poc", config={"UPLOAD_DIR": upload_dir, "MAX_MEMORY_FILE_SIZE": 1, "UPLOAD_DELETE_TMP": True})
+            payload = (
+                b'--poc\r\nContent-Disposition: form-data; name="f"; filename="up.txt"\r\n\r\n'
+                + b"X" * 50
+                + b"\r\n--poc\r\nContent-Disposition: bad-header\r\n\r\n"
+            )
+            with self.assertRaises(FormParserError):
+                self.f.write(payload)
+            self.assertEqual(os.listdir(upload_dir), [])
+
+    def test_truncated_request_removes_its_disk_files(self) -> None:
+        with tempfile.TemporaryDirectory() as upload_dir:
+            self.make(
+                "poc",
+                config={
+                    "UPLOAD_DIR": upload_dir,
+                    "MAX_MEMORY_FILE_SIZE": 1,
+                    "UPLOAD_DELETE_TMP": True,
+                    "MAX_BODY_SIZE": 60,
+                },
+            )
+            # A file large enough to be flushed to disk, then cut off by the body
+            # budget before the closing boundary arrives.
+            payload = b'--poc\r\nContent-Disposition: form-data; name="f"; filename="up.txt"\r\n\r\n' + b"Y" * 200
+            self.f.write(payload)
+            with self.assertRaises(MultipartParseError):
+                self.f.finalize()
+            self.assertEqual(os.listdir(upload_dir), [])
+
     @parametrize("rest", [b"x", b"\rx"])
     def test_multipart_boundary_padding_without_crlf(self, rest: bytes) -> None:
         self.make("poc")
@@ -1732,10 +1834,12 @@ class TestFormParser(unittest.TestCase):
         self.f.parser.max_size = float(len(test_data)) / 2
 
         i = self.f.write(test_data)
-        self.f.finalize()
-
-        # Assert we processed the correct amount.
+        # The budget still truncates how much of the body is processed...
         self.assertEqual(i, len(test_data) / 2)
+        # ...but a truncated multipart message has no closing boundary, so it
+        # must fail at finalize instead of being accepted as a complete request.
+        with self.assertRaisesRegex(MultipartParseError, "closing boundary not found"):
+            self.f.finalize()
 
     def test_max_size_form_parser(self) -> None:
         # Load test data.
@@ -1749,10 +1853,12 @@ class TestFormParser(unittest.TestCase):
         self.make("boundary", config={"MAX_BODY_SIZE": size})
 
         i = self.f.write(test_data)
-        self.f.finalize()
-
-        # Assert we processed the correct amount.
+        # The body budget truncates processing mid-message...
         self.assertEqual(i, len(test_data) / 2)
+        # ...and finalize rejects the incomplete message rather than silently
+        # delivering a cut-off field or file.
+        with self.assertRaisesRegex(MultipartParseError, "closing boundary not found"):
+            self.f.finalize()
 
     def test_octet_stream_max_size(self) -> None:
         files: list[File] = []

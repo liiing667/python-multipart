@@ -1621,13 +1621,13 @@ class MultipartParser(BaseParser):
     def finalize(self) -> None:
         """Finalize this parser, which signals to that we are finished parsing.
 
-        Note: It does not currently, but in the future, it will verify that we
-        are in the final state of the parser (i.e. the end of the multipart
-        message is well-formed), and, if not, throw an error.
+        A well-formed multipart message must end with the closing boundary, which
+        moves the parser into :class:`MultipartState.END`. Anything else is an
+        incomplete or truncated message - including a body cut short by
+        ``max_size`` - and must fail instead of being silently accepted.
         """
-        # TODO: verify that we're in the state MultipartState.END, otherwise throw an
-        # error or otherwise state that we're not finished parsing.
-        pass
+        if self.state != END:
+            raise MultipartParseError("Unexpected end of multipart message: closing boundary not found")
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(boundary={self.boundary!r})"
@@ -1699,6 +1699,9 @@ class FormParser:
         self.config.update(config)  # type: ignore[typeddict-item]
 
         parser: OctetStreamParser | MultipartParser | QuerystringParser | None = None
+        # Files opened by this request across all parts. They are tracked so a
+        # failed request cannot leave temporary files behind in UPLOAD_DIR.
+        self._opened_files: list[File] = []
 
         # Depending on the Content-Type, we instantiate the correct parser.
         if content_type == "application/octet-stream":
@@ -1707,6 +1710,7 @@ class FormParser:
             def on_start() -> None:
                 nonlocal file
                 file = File(file_name, None, config=self.config)
+                self._opened_files.append(file)
 
             def on_data(data: bytes, start: int, end: int) -> None:
                 nonlocal file
@@ -1808,20 +1812,38 @@ class FormParser:
             header_name: list[bytes] = []
             header_value: list[bytes] = []
             headers: dict[bytes, bytes] = {}
+            # The raw, untrimmed value of each header, needed to detect the
+            # RFC 5987/2231 extended syntax (`key*=`, `key*0=`, ...) before
+            # `parse_options_header` strips those parameters away.
+            raw_headers: dict[bytes, bytes] = {}
 
             f_multi: File | Field | None = None
             writer: File | Field | Base64Decoder | QuotedPrintableDecoder | None = None
             is_file = False
+            field_count = 0
+            field_size = 0
+
+            max_fields = self.config["MAX_FIELDS"]
+            max_field_size = self.config["MAX_FIELD_SIZE"]
+            for key, limit in (("MAX_FIELDS", max_fields), ("MAX_FIELD_SIZE", max_field_size)):
+                if not isinstance(limit, (int, float)) or not limit >= 0:
+                    raise ValueError(f"{key} must be a non-negative number, not {limit!r}")
 
             def on_part_begin() -> None:
                 # Reset headers in case this isn't the first part.
-                nonlocal headers
+                nonlocal headers, raw_headers
                 headers = {}
+                raw_headers = {}
 
             def on_part_data(data: bytes, start: int, end: int) -> None:
-                nonlocal writer
+                nonlocal writer, field_size
                 assert writer is not None
-                writer.write(data[start:end])
+                chunk = data[start:end]
+                if not is_file:
+                    field_size += len(chunk)
+                    if field_size > max_field_size:
+                        raise FormParserError(f"Field exceeded maximum size of {max_field_size} bytes.")
+                writer.write(chunk)
                 # TODO: check for error here.
 
             def on_part_end() -> None:
@@ -1844,14 +1866,30 @@ class FormParser:
                 header_value.append(data[start:end])
 
             def on_header_end() -> None:
-                headers[b"".join(header_name).lower()] = b"".join(header_value).strip(b" \t")
+                name = b"".join(header_name).lower()
+                value = b"".join(header_value)
+                raw_headers[name] = value
+                headers[name] = value.strip(b" \t")
                 del header_name[:]
                 del header_value[:]
 
             def on_headers_finished() -> None:
-                nonlocal is_file, f_multi, writer
+                nonlocal is_file, f_multi, writer, field_count, field_size
                 # Reset the 'is file' flag.
                 is_file = False
+
+                # RFC 7578 §4.2 forbids the RFC 5987/2231 extended syntax in
+                # multipart/form-data. A `key*`/`key*n` parameter carries its
+                # own charset and continuation state; honoring it would let an
+                # attacker switch encodings mid-header and diverge from the
+                # plain parameters every security decision below is based on.
+                for raw_value in raw_headers.values():
+                    for segment in _parseparam(raw_value.decode("latin-1")):
+                        param_name = segment.partition("=")[0].strip(" \t")
+                        if "*" in param_name:
+                            raise FormParserError(
+                                f"RFC 2231 extended parameters are not allowed in multipart/form-data: {segment!r}"
+                            )
 
                 # Parse the content-disposition header.
                 content_disp = headers.get(b"content-disposition")
@@ -1867,10 +1905,29 @@ class FormParser:
                 # Create the proper class.
                 content_type_b = headers.get(b"content-type")
                 content_type = content_type_b.decode("latin-1") if content_type_b is not None else None
+
+                # A part that is itself a multipart container would establish a
+                # second, independent parser whose parts do not share this
+                # request's policy or budget. RFC 7578 only allows single parts,
+                # so reject nested multipart content types outright.
+                if content_type is not None:
+                    part_type = parse_options_header(content_type)[0]
+                    if part_type.startswith(b"multipart/"):
+                        raise FormParserError(
+                            f"Nested multipart content is not allowed in multipart/form-data: {part_type!r}"
+                        )
+
+                field_count += 1
+                if field_count > max_fields:
+                    raise FormParserError(f"Too many fields. Maximum number of fields is {max_fields}.")
+                field_size = 0
+
                 if file_name is None:
                     f_multi = Field(field_name, content_type=content_type)
                 else:
-                    f_multi = File(file_name, field_name, config=self.config, content_type=content_type)
+                    new_file = File(file_name, field_name, config=self.config, content_type=content_type)
+                    f_multi = new_file
+                    self._opened_files.append(new_file)
                     is_file = True
 
                 # Parse the given Content-Transfer-Encoding to determine what
@@ -1939,17 +1996,47 @@ class FormParser:
         self.bytes_received += len(data)
         # TODO: check the parser's return value for errors?
         assert self.parser is not None
-        return self.parser.write(data)
+        try:
+            return self.parser.write(data)
+        except BaseException:
+            # A request that fails its security checks must not keep any of
+            # the files it was streaming to disk.
+            self._discard_files()
+            raise
 
     def finalize(self) -> None:
         """Finalize the parser."""
-        if self.parser is not None and hasattr(self.parser, "finalize"):
-            self.parser.finalize()
+        try:
+            if self.parser is not None and hasattr(self.parser, "finalize"):
+                self.parser.finalize()
+        except BaseException:
+            self._discard_files()
+            raise
 
     def close(self) -> None:
         """Close the parser."""
         if self.parser is not None and hasattr(self.parser, "close"):
             self.parser.close()
+        for opened_file in self._opened_files:
+            opened_file.close()
+        self._opened_files.clear()
+
+    def _discard_files(self) -> None:
+        """Close every file opened by this request and remove any on-disk
+        temporary file, so a rejected request leaves neither open handles nor
+        artifacts inside ``UPLOAD_DIR``.
+        """
+        for opened_file in self._opened_files:
+            file_path = opened_file.actual_file_name
+            try:
+                opened_file.close()
+            finally:
+                if file_path is not None and self.config.get("UPLOAD_DELETE_TMP", True):
+                    try:
+                        os.unlink(os.fsdecode(file_path))
+                    except FileNotFoundError:
+                        pass
+        self._opened_files.clear()
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(content_type={self.content_type!r}, parser={self.parser!r})"
