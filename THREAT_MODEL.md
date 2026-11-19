@@ -22,6 +22,12 @@
 - Uploaded files stay inside `UPLOAD_DIR`.
 - Temporary files are deleted when `UPLOAD_DELETE_TMP` is `True`.
 
+To keep uploads inside `UPLOAD_DIR`, a kept filename is reduced to a safe basename (both `/` and `\` directory
+components are stripped, and names that reduce to nothing usable fall back to a random temporary name), and the
+final path is verified to resolve directly inside `UPLOAD_DIR` before it is opened. Filenames are used as sent:
+the library does not percent-decode them, and RFC 2231/5987 extended parameters (`filename*`) are ignored per
+RFC 7578 §4.2, so the name reported on the `File` is the same name used on disk.
+
 ## What counts as a vulnerability
 
 - Memory or CPU use out of proportion to the input, or a bypass of a configured limit.

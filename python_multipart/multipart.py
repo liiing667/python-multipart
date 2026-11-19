@@ -254,6 +254,21 @@ def parse_options_header(value: str | bytes | None) -> tuple[bytes, dict[bytes, 
     return ctype.lower().encode("latin-1"), options
 
 
+def _sanitize_filename(file_name: bytes) -> bytes | None:
+    """Reduce an untrusted filename to a safe basename for on-disk use.
+
+    Both `/` and `\\` are treated as path separators, so the resulting name is
+    the same no matter which platform the server runs on. Returns None when no
+    usable name remains (empty, or only `.`/`..` components), in which case the
+    caller falls back to a random temporary name.
+    """
+    name = file_name.rstrip(b"/\\")
+    name = name[max(name.rfind(b"/"), name.rfind(b"\\")) + 1 :]
+    if name in (b"", b".", b"..") or b"\x00" in name:
+        return None
+    return name
+
+
 class Field:
     """A Field object represents a (parsed) form field.  It represents a single
     field with a corresponding name and value.
@@ -401,7 +416,7 @@ class File:
     |-----------------------|-------|---------|-------------|
     | UPLOAD_DIR            | `str` | None    | The directory to store uploaded files in. If this is None, a temporary file will be created in the system's standard location. |
     | UPLOAD_DELETE_TMP     | `bool`| True    | Delete automatically created TMP file |
-    | UPLOAD_KEEP_FILENAME  | `bool`| False   | Whether or not to keep the filename of the uploaded file. If True, then the filename is reduced to its basename (directory components are stripped) and the file is saved with that name. Otherwise, a temporary name will be used. |
+    | UPLOAD_KEEP_FILENAME  | `bool`| False   | Whether or not to keep the filename of the uploaded file. If True, then the filename is reduced to a safe basename (both `/` and `\\` directory components are stripped) and the file is saved with that name, after verifying the final path stays inside `UPLOAD_DIR`. Names that reduce to nothing usable (empty, `.` or `..`) fall back to a temporary name. Otherwise, a temporary name will be used. |
     | UPLOAD_KEEP_EXTENSIONS| `bool`| False   | Whether or not to keep the uploaded file's extension. If False, the file will be saved with the default temporary extension (usually ".tmp"). Otherwise, the file's extension will be maintained. Note that this will properly combine with the UPLOAD_KEEP_FILENAME setting. |
     | MAX_MEMORY_FILE_SIZE  | `int` | 1 MiB   | The maximum number of bytes of a File to keep in memory. By default, the contents of a File are kept into memory until a certain limit is reached, after which the contents of the File are written to a temporary file. This behavior can be disabled by setting this value to an appropriately large value (or, for example, infinity, such as `float('inf')`. |
 
@@ -441,11 +456,15 @@ class File:
         self._file_base: bytes | None = None
         self._ext = b""
         if file_name is not None:
-            # Extract just the basename to avoid directory traversal
-            basename = os.path.basename(file_name)
-            base, ext = os.path.splitext(basename)
-            self._file_base = base
-            self._ext = ext
+            # Reduce the untrusted filename to a safe basename, so that
+            # directory components can never traverse out of the upload
+            # directory. Names without a usable basename are treated like
+            # nameless uploads and get a random temporary name instead.
+            basename = _sanitize_filename(file_name)
+            if basename is not None:
+                base, ext = os.path.splitext(basename)
+                self._file_base = base
+                self._ext = ext
 
     @property
     def field_name(self) -> bytes | None:
@@ -545,10 +564,19 @@ class File:
             fname = self._file_base + self._ext if keep_extensions else self._file_base
 
             path = os.path.join(os.fsencode(file_dir), fname)
+
+            # Refuse out-of-bounds writes: the final path must resolve to a
+            # file directly inside the upload directory. The sanitized name
+            # cannot contain separators, so this is a defense-in-depth check
+            # against traversal sequences and pre-placed symlinks.
+            if os.path.dirname(os.path.realpath(path)) != os.path.realpath(os.fsencode(file_dir)):
+                self.logger.warning("Refusing to write outside of UPLOAD_DIR: %r", path)
+                raise FileError("Refusing to write outside of UPLOAD_DIR: %r" % path)
+
             try:
                 self.logger.info("Opening file: %r", path)
                 tmp_file = open(path, "w+b")
-            except OSError:
+            except (OSError, ValueError):
                 tmp_file = None
 
                 self.logger.exception("Error opening temporary file")
@@ -572,7 +600,7 @@ class File:
             )
             try:
                 tmp_file = cast(BufferedRandom, tempfile.NamedTemporaryFile(suffix=suffix, delete=delete_tmp, dir=dir))
-            except OSError:
+            except (OSError, ValueError):
                 self.logger.exception("Error creating named temporary file")
                 raise FileError("Error creating named temporary file")
 

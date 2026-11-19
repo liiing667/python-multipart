@@ -1199,6 +1199,43 @@ class TestFormParser(unittest.TestCase):
             finally:
                 os.unlink(actual_file_name)
 
+    def test_upload_filename_traversal_stays_in_upload_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as upload_dir:
+            self.make(
+                "boundary",
+                config={
+                    "UPLOAD_DIR": upload_dir,
+                    "UPLOAD_KEEP_FILENAME": True,
+                    "UPLOAD_KEEP_EXTENSIONS": True,
+                    "MAX_MEMORY_FILE_SIZE": 1,
+                },
+            )
+
+            # The plain `filename` is authoritative; the RFC 2231 `filename*`
+            # is ignored, and the kept name is reduced to a safe basename.
+            data = (
+                b"--boundary\r\n"
+                b'Content-Disposition: form-data; name="file"; filename="..\\..\\evil.txt";'
+                b" filename*=utf-8''..%2f..%2fpwned.txt\r\n"
+                b"Content-Type: text/plain\r\n"
+                b"\r\n"
+                b"malicious\r\n"
+                b"--boundary--\r\n"
+            )
+            self.f.write(data)
+            self.f.finalize()
+
+            self.assertEqual(len(self.files), 1)
+            uploaded_file = self.files[0]
+            self.assertEqual(uploaded_file.actual_file_name, b"evil.txt")
+            uploaded_file.close()
+
+            self.assertEqual(os.listdir(upload_dir), ["evil.txt"])
+            with open(os.path.join(upload_dir, "evil.txt"), "rb") as f:
+                self.assertEqual(f.read(), b"malicious")
+            self.assertFalse(os.path.exists(os.path.join(upload_dir, "..", "evil.txt")))
+            self.assertFalse(os.path.exists(os.path.join(upload_dir, "..", "pwned.txt")))
+
     @parametrize("param", [t for t in http_tests if t["name"] in single_byte_tests])
     def test_feed_single_bytes(self, param: TestParams) -> None:
         """

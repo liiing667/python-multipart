@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+* Reduce uploaded filenames to a safe basename on every platform by stripping both `/` and `\\` directory components, and fall back to a random temporary name when nothing usable remains (empty, `.` or `..`).
+* Verify before opening that a kept filename resolves to a path directly inside `UPLOAD_DIR`, and refuse out-of-bounds writes with `FileError`.
+* Treat filenames containing null bytes as unusable instead of leaking `ValueError` from the filesystem calls.
+
 ## 0.0.34 (2026-11-16)
 
 * Reduce multipart parser overhead by removing mark-helper closures and consuming buffered line endings [#370](https://github.com/Kludex/python-multipart/pull/370), [#373](https://github.com/Kludex/python-multipart/pull/373).
